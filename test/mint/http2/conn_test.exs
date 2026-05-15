@@ -2124,6 +2124,309 @@ defmodule Mint.HTTP2Test do
     end
   end
 
+  describe "manual window management" do
+    @describetag connect_options: [
+                   manual_window_management: true,
+                   connection_window_size: 100_000,
+                   receive_window_update_threshold: 40_000,
+                   client_settings: [initial_window_size: 100_000]
+                 ]
+
+    test "incoming DATA never triggers an automatic WINDOW_UPDATE — connection level",
+         %{conn: conn} do
+      {conn, _ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      # 70_000 bytes of DATA — under the auto-refill regime this would
+      # cross the 40_000 threshold on both the connection and stream
+      # windows and produce two WINDOW_UPDATE frames. In manual mode
+      # neither should appear.
+      chunk = String.duplicate("a", 10_000)
+      frames = for _ <- 1..7, do: data(stream_id: stream_id, data: chunk)
+
+      assert {:ok, %HTTP2{} = conn, _responses} = stream_frames(conn, frames)
+      assert_recv_frames []
+
+      # State has tracked the consumption even though no frame went out.
+      assert conn.receive_window_remaining == 100_000 - 70_000
+      assert conn.streams[stream_id].receive_window_remaining == 100_000 - 70_000
+    end
+
+    test "consume_window/3 emits a stream-0 WINDOW_UPDATE of exactly the requested increment",
+         %{conn: conn} do
+      {conn, _ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: _stream_id)]
+
+      chunk = String.duplicate("a", 10_000)
+      assert {:ok, conn, _} = stream_frames(conn, [data(stream_id: 1, data: chunk)])
+
+      before_remaining = conn.receive_window_remaining
+
+      assert {:ok, conn} = HTTP2.consume_window(conn, :connection, 7_500)
+
+      assert_recv_frames [window_update(stream_id: 0, window_size_increment: 7_500)]
+      assert conn.receive_window_remaining == before_remaining + 7_500
+    end
+
+    test "consume_window/3 emits a stream-N WINDOW_UPDATE of exactly the requested increment",
+         %{conn: conn} do
+      {conn, ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      chunk = String.duplicate("a", 10_000)
+      assert {:ok, conn, _} = stream_frames(conn, [data(stream_id: stream_id, data: chunk)])
+
+      before_remaining = conn.streams[stream_id].receive_window_remaining
+
+      assert {:ok, conn} = HTTP2.consume_window(conn, {:request, ref}, 4_321)
+
+      assert_recv_frames [
+        window_update(stream_id: ^stream_id, window_size_increment: 4_321)
+      ]
+
+      assert conn.streams[stream_id].receive_window_remaining == before_remaining + 4_321
+    end
+
+    test "multiple consume_window/3 calls emit one WINDOW_UPDATE each", %{conn: conn} do
+      {conn, ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      chunk = String.duplicate("a", 10_000)
+      frames = for _ <- 1..9, do: data(stream_id: stream_id, data: chunk)
+      assert {:ok, conn, _} = stream_frames(conn, frames)
+
+      {:ok, conn} = HTTP2.consume_window(conn, {:request, ref}, 30_000)
+      {:ok, conn} = HTTP2.consume_window(conn, {:request, ref}, 30_000)
+      {:ok, _conn} = HTTP2.consume_window(conn, {:request, ref}, 30_000)
+
+      assert_recv_frames [
+        window_update(stream_id: ^stream_id, window_size_increment: 30_000),
+        window_update(stream_id: ^stream_id, window_size_increment: 30_000),
+        window_update(stream_id: ^stream_id, window_size_increment: 30_000)
+      ]
+    end
+
+    test "consume_window/3 over-consume on connection returns :window_overflow", %{conn: conn} do
+      {conn, _ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: _stream_id)]
+
+      chunk = String.duplicate("a", 10_000)
+      # Only 30_000 bytes have been received and tracked.
+      assert {:ok, conn, _} =
+               stream_frames(conn, for(_ <- 1..3, do: data(stream_id: 1, data: chunk)))
+
+      assert {:error, ^conn, error} = HTTP2.consume_window(conn, :connection, 40_000)
+
+      assert_http2_error error, {:window_overflow, :connection, 40_000, 30_000}
+
+      # No frame was sent for the rejected call.
+      assert_recv_frames []
+    end
+
+    test "consume_window/3 over-consume on a request returns :window_overflow", %{conn: conn} do
+      {conn, ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      chunk = String.duplicate("a", 10_000)
+
+      assert {:ok, conn, _} =
+               stream_frames(conn, for(_ <- 1..2, do: data(stream_id: stream_id, data: chunk)))
+
+      assert {:error, ^conn, error} = HTTP2.consume_window(conn, {:request, ref}, 25_000)
+
+      assert_http2_error error, {:window_overflow, {:request, ^ref}, 25_000, 20_000}
+
+      assert_recv_frames []
+    end
+
+    test "consume_window/3 returns :unknown_request_to_stream for an unknown ref",
+         %{conn: conn} do
+      fake_ref = make_ref()
+
+      assert {:error, ^conn, error} = HTTP2.consume_window(conn, {:request, fake_ref}, 1_000)
+
+      assert_http2_error error, {:unknown_request_to_stream, ^fake_ref}
+      assert_recv_frames []
+    end
+
+    test "consume_window/3 raises on invalid byte_count", %{conn: conn} do
+      assert_raise ArgumentError, ~r/1\.\.2147483647/, fn ->
+        HTTP2.consume_window(conn, :connection, 0)
+      end
+
+      assert_raise ArgumentError, ~r/1\.\.2147483647/, fn ->
+        HTTP2.consume_window(conn, :connection, -5)
+      end
+
+      assert_raise ArgumentError, ~r/1\.\.2147483647/, fn ->
+        HTTP2.consume_window(conn, :connection, 3_000_000_000)
+      end
+
+      assert_raise ArgumentError, ~r/1\.\.2147483647/, fn ->
+        HTTP2.consume_window(conn, :connection, :nope)
+      end
+
+      assert_raise ArgumentError, ~r/1\.\.2147483647/, fn ->
+        HTTP2.consume_window(conn, {:request, make_ref()}, 0)
+      end
+    end
+
+    test "connection-level and stream-level credit are independent", %{conn: conn} do
+      {conn, ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      chunk = String.duplicate("a", 10_000)
+
+      assert {:ok, conn, _} =
+               stream_frames(conn, for(_ <- 1..5, do: data(stream_id: stream_id, data: chunk)))
+
+      # Release 50_000 against the stream only; connection unacked stays 50_000.
+      {:ok, conn} = HTTP2.consume_window(conn, {:request, ref}, 50_000)
+      assert_recv_frames [window_update(stream_id: ^stream_id, window_size_increment: 50_000)]
+
+      # Stream is now fully released, but the connection still owes 50_000 —
+      # an attempt to release 60_000 against the stream must fail
+      # (stream unacked is 0).
+      assert {:error, ^conn, stream_err} =
+               HTTP2.consume_window(conn, {:request, ref}, 60_000)
+
+      assert_http2_error stream_err, {:window_overflow, {:request, ^ref}, 60_000, 0}
+
+      # But 50_000 against the connection succeeds.
+      {:ok, _conn} = HTTP2.consume_window(conn, :connection, 50_000)
+      assert_recv_frames [window_update(stream_id: 0, window_size_increment: 50_000)]
+    end
+
+    test "server can fully exhaust the receive window without auto-refill", %{conn: conn} do
+      {conn, ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      # 10 frames × 10_000 bytes = 100_000 — exactly the configured window.
+      chunk = String.duplicate("a", 10_000)
+      frames = for _ <- 1..10, do: data(stream_id: stream_id, data: chunk)
+      assert {:ok, conn, _} = stream_frames(conn, frames)
+
+      # Window is fully consumed at the protocol level — server would now stall.
+      assert conn.receive_window_remaining == 0
+      assert conn.streams[stream_id].receive_window_remaining == 0
+      assert_recv_frames []
+
+      # Caller releases half against both; mint emits one WINDOW_UPDATE per call.
+      {:ok, conn} = HTTP2.consume_window(conn, {:request, ref}, 50_000)
+      {:ok, conn} = HTTP2.consume_window(conn, :connection, 50_000)
+
+      assert_recv_frames [
+        window_update(stream_id: ^stream_id, window_size_increment: 50_000),
+        window_update(stream_id: 0, window_size_increment: 50_000)
+      ]
+
+      assert conn.receive_window_remaining == 50_000
+      assert conn.streams[stream_id].receive_window_remaining == 50_000
+    end
+
+    test "end_of_stream from the server does not implicitly auto-credit", %{conn: conn} do
+      {conn, ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      chunk = String.duplicate("a", 10_000)
+
+      assert {:ok, conn, responses} =
+               stream_frames(conn, [
+                 headers(
+                   stream_id: stream_id,
+                   hbf: server_encode_headers([{":status", "200"}]),
+                   flags: set_flags(:headers, [:end_headers])
+                 ),
+                 data(
+                   stream_id: stream_id,
+                   data: chunk,
+                   flags: set_flags(:data, [:end_stream])
+                 )
+               ])
+
+      assert Enum.any?(responses, &match?({:done, ^ref}, &1))
+
+      # Even though the stream is over, no WINDOW_UPDATE was emitted; the
+      # connection-level credit is held for the caller to release.
+      assert_recv_frames []
+      assert conn.receive_window_remaining == 100_000 - 10_000
+
+      # Stream is gone — releasing against it errors; release the connection
+      # credit instead.
+      assert {:error, ^conn, error} = HTTP2.consume_window(conn, {:request, ref}, 10_000)
+      assert_http2_error error, {:unknown_request_to_stream, ^ref}
+
+      {:ok, _conn} = HTTP2.consume_window(conn, :connection, 10_000)
+      assert_recv_frames [window_update(stream_id: 0, window_size_increment: 10_000)]
+    end
+
+    test "set_window_size/3 interoperates: raises peak, consume_window honours new peak",
+         %{conn: conn} do
+      {conn, ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      # Raise the stream peak from 100_000 to 500_000; that emits its own
+      # WINDOW_UPDATE for the bump (this is the existing set_window_size
+      # behaviour, independent of manual mode).
+      {:ok, conn} = HTTP2.set_window_size(conn, {:request, ref}, 500_000)
+      assert_recv_frames [window_update(stream_id: ^stream_id, window_size_increment: 400_000)]
+
+      chunk = String.duplicate("a", 10_000)
+
+      assert {:ok, conn, _} =
+               stream_frames(conn, for(_ <- 1..20, do: data(stream_id: stream_id, data: chunk)))
+
+      # 200_000 bytes received. Manual mode → no WINDOW_UPDATE from refill.
+      assert_recv_frames []
+
+      # Overflow check now uses the raised peak: 250_000 > 200_000 unacked.
+      assert {:error, ^conn, error} = HTTP2.consume_window(conn, {:request, ref}, 250_000)
+      assert_http2_error error, {:window_overflow, {:request, ^ref}, 250_000, 200_000}
+
+      # And consuming up to unacked works.
+      {:ok, _conn} = HTTP2.consume_window(conn, {:request, ref}, 200_000)
+      assert_recv_frames [window_update(stream_id: ^stream_id, window_size_increment: 200_000)]
+    end
+
+    test "cancel_request/2 deletes the stream; connection credit can still be released",
+         %{conn: conn} do
+      {conn, ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      chunk = String.duplicate("a", 10_000)
+
+      assert {:ok, conn, _} =
+               stream_frames(conn, for(_ <- 1..3, do: data(stream_id: stream_id, data: chunk)))
+
+      assert {:ok, conn} = HTTP2.cancel_request(conn, ref)
+      assert_recv_frames [rst_stream(stream_id: ^stream_id, error_code: :cancel)]
+
+      # Stream-level consume now fails because the stream is gone.
+      assert {:error, ^conn, error} = HTTP2.consume_window(conn, {:request, ref}, 1)
+      assert_http2_error error, {:unknown_request_to_stream, ^ref}
+
+      # But the connection-level credit is still releasable.
+      assert {:ok, conn} = HTTP2.consume_window(conn, :connection, 30_000)
+      assert_recv_frames [window_update(stream_id: 0, window_size_increment: 30_000)]
+      assert conn.receive_window_remaining == 100_000
+    end
+  end
+
+  describe "manual_window_management option validation" do
+    @describetag :no_connection
+
+    test "raises if :manual_window_management is not a boolean", %{server_port: port} do
+      message = ~r/the :manual_window_management option must be a boolean, got: "yes"/
+
+      assert_raise ArgumentError, message, fn ->
+        HTTP2.connect(:https, "localhost", port,
+          manual_window_management: "yes",
+          transport_opts: [verify: :verify_none]
+        )
+      end
+    end
+  end
+
   describe "settings" do
     test "put_settings/2 can be used to send settings to server", %{conn: conn} do
       {:ok, conn} =

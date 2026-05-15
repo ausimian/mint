@@ -226,5 +226,140 @@ defmodule HTTP2.IntegrationTest do
     end
   end
 
+  describe "manual window management against local caddyhttpbin" do
+    # Minimum HTTP/2 window allowed; we keep both the connection and the
+    # per-stream window small so the 1 MB body cannot land in one shot —
+    # the server must honour our WINDOW_UPDATE frames between chunks.
+    @small_window 65_535
+    # httpbin caps /bytes/N at 100 KiB, so pick a body that exceeds the
+    # configured 65_535-byte window (forcing at least one
+    # WINDOW_UPDATE round-trip) but stays under the cap.
+    @body_size 100_000
+
+    test "downloads a 100 KB body in chunks, releasing window credit per chunk" do
+      assert {:ok, conn} =
+               HTTP2.connect(:https, HttpBin.host(), HttpBin.https_port(),
+                 transport_opts: HttpBin.https_transport_opts(),
+                 mode: :passive,
+                 manual_window_management: true,
+                 connection_window_size: @small_window,
+                 client_settings: [initial_window_size: @small_window]
+               )
+
+      assert {:ok, conn, ref} = HTTP2.request(conn, "GET", "/bytes/#{@body_size}", [], nil)
+
+      {conn, %{status: status, body: body, done?: done?}} =
+        drain_with_consume(conn, ref)
+
+      assert done?
+      assert status == 200
+      assert byte_size(body) == @body_size
+      assert HTTP2.open?(conn)
+    end
+
+    test "server stalls when the connection window hits 0, resumes after consume_window/3" do
+      assert {:ok, conn} =
+               HTTP2.connect(:https, HttpBin.host(), HttpBin.https_port(),
+                 transport_opts: HttpBin.https_transport_opts(),
+                 mode: :passive,
+                 manual_window_management: true,
+                 connection_window_size: @small_window,
+                 client_settings: [initial_window_size: @small_window]
+               )
+
+      assert {:ok, conn, ref} = HTTP2.request(conn, "GET", "/bytes/#{@body_size}", [], nil)
+
+      # Drain — without consuming — until the connection window is empty.
+      # The 1 MB body cannot complete in @small_window bytes, so the
+      # server will stop sending exactly at the window boundary.
+      {conn, received} = drain_until_window_empty(conn, ref, "")
+
+      assert byte_size(received) > 0
+      assert byte_size(received) <= @small_window
+      assert conn.receive_window_remaining == 0
+
+      # With the window at 0 and manual mode on, no WINDOW_UPDATE has been
+      # emitted. The server should not send another byte — recv must time
+      # out.
+      assert {:error, conn, %Mint.TransportError{reason: :timeout}, []} =
+               HTTP2.recv(conn, 0, 300)
+
+      # Release credit on both axes. The amounts come from what we
+      # actually received: per-stream unacked == byte_size(received),
+      # connection unacked == byte_size(received).
+      assert {:ok, conn} = HTTP2.consume_window(conn, :connection, byte_size(received))
+      assert {:ok, conn} = HTTP2.consume_window(conn, {:request, ref}, byte_size(received))
+
+      # Now the server is allowed to send again — recv should return more
+      # data within a short timeout (round-trip across loopback).
+      assert {:ok, _conn, responses} = HTTP2.recv(conn, 0, 5_000)
+      more = data_only(responses, ref)
+      assert byte_size(more) > 0
+    end
+
+    defp drain_with_consume(conn, ref) do
+      drain_with_consume(conn, ref, %{status: nil, headers: nil, body: "", done?: false})
+    end
+
+    defp drain_with_consume(conn, _ref, %{done?: true} = acc), do: {conn, acc}
+
+    defp drain_with_consume(conn, ref, acc) do
+      assert {:ok, conn, responses} = HTTP2.recv(conn, 0, 10_000)
+
+      {conn, acc} =
+        Enum.reduce(responses, {conn, acc}, fn
+          {:status, ^ref, status}, {c, a} ->
+            {c, %{a | status: status}}
+
+          {:headers, ^ref, headers}, {c, a} ->
+            {c, %{a | headers: headers}}
+
+          {:data, ^ref, chunk}, {c, a} ->
+            size = byte_size(chunk)
+
+            # An empty DATA frame (sent by some servers to flag END_STREAM
+            # with no payload) consumes no flow-control credit, so there
+            # is nothing to release.
+            c =
+              if size > 0 do
+                {:ok, c} = HTTP2.consume_window(c, :connection, size)
+
+                case HTTP2.consume_window(c, {:request, ref}, size) do
+                  {:ok, c} -> c
+                  # End-of-stream may have already closed the stream entry.
+                  {:error, c, _} -> c
+                end
+              else
+                c
+              end
+
+            {c, %{a | body: a.body <> chunk}}
+
+          {:done, ^ref}, {c, a} ->
+            {c, %{a | done?: true}}
+        end)
+
+      drain_with_consume(conn, ref, acc)
+    end
+
+    defp drain_until_window_empty(conn, ref, body) do
+      if conn.receive_window_remaining == 0 do
+        {conn, body}
+      else
+        assert {:ok, conn, responses} = HTTP2.recv(conn, 0, 5_000)
+        drain_until_window_empty(conn, ref, body <> data_only(responses, ref))
+      end
+    end
+
+    defp data_only(responses, ref) do
+      responses
+      |> Enum.flat_map(fn
+        {:data, ^ref, chunk} -> [chunk]
+        _ -> []
+      end)
+      |> IO.iodata_to_binary()
+    end
+  end
+
   # TODO: certificate verification; badssl.com does not seem to support HTTP2
 end

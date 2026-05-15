@@ -252,6 +252,13 @@ defmodule Mint.HTTP do
       at or below the threshold, the client refills after every DATA frame on
       that window. *Available since v1.8.0*.
 
+    * `:manual_window_management` - (boolean) when `true`, mint will not
+      auto-emit `WINDOW_UPDATE` frames in response to incoming DATA frames;
+      the caller must release receive-window credit explicitly via
+      `Mint.HTTP2.consume_window/3`. Use this to apply consumption-coupled
+      backpressure at the stream level. Defaults to `false`.
+      *Available since v1.9.0*.
+
   There may be further protocol specific options that only take effect when the corresponding
   connection is established. Check `Mint.HTTP1.connect/4` and `Mint.HTTP2.connect/4` for
   details.

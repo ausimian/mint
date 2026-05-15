@@ -204,6 +204,11 @@ defmodule Mint.HTTP2 do
     # Minimum remaining receive window before we send a WINDOW_UPDATE.
     # Configurable via the `:receive_window_update_threshold` connect option.
     receive_window_update_threshold: @default_receive_window_update_threshold,
+    # When true, mint never auto-emits WINDOW_UPDATEs in response to DATA
+    # frames; the caller must release credit explicitly via
+    # `consume_window/3`. Set via the `:manual_window_management` connect
+    # option.
+    manual_window_management?: false,
     encode_table: HPAX.new(4096),
     decode_table: HPAX.new(4096),
 
@@ -376,6 +381,12 @@ defmodule Mint.HTTP2 do
 
     * `{:flow_control_error, debug_data}` - when there's a flow control error.
       `debug_data` is a string that explains the nature of the error.
+
+    * `{:window_overflow, target, requested_bytes, unacked_bytes}` - when a call
+      to `consume_window/3` requests more bytes than are currently unacked on
+      `target` (either `:connection` or `{:request, ref}`). `requested_bytes`
+      is the value passed in and `unacked_bytes` is the maximum that could
+      have been consumed.
 
   """
   @type error_reason() :: term()
@@ -953,6 +964,112 @@ defmodule Mint.HTTP2 do
   end
 
   @doc """
+  Releases receive-window credit back to the server, emitting a
+  `WINDOW_UPDATE` frame.
+
+  Use this together with the `:manual_window_management` option to
+  `connect/4`. In that mode `stream/2` and `recv/3` will surface incoming
+  `{:data, ref, payload}` responses but **will not** auto-acknowledge them
+  at the HTTP/2 protocol level; the caller decides when bytes are eligible
+  to be replenished by calling `consume_window/3`.
+
+  This is the only way to apply *consumption-coupled* backpressure to a
+  single HTTP/2 stream — without it, an unread response body can pin up to
+  `min(connection_window, stream_window)` bytes in memory.
+
+  `connection_or_request` is `:connection` to release credit for the
+  connection-level window (emits the `WINDOW_UPDATE` on stream 0) or
+  `{:request, request_ref}` for one request's stream. `byte_count` must
+  be a positive integer in `1..2_147_483_647`. The function emits exactly
+  one `WINDOW_UPDATE` of `byte_count` bytes — no batching is performed;
+  if you want batching, simply call this function less often.
+
+  ## Errors
+
+    * `{:error, conn, %Mint.HTTPError{reason: {:window_overflow, target, requested, unacked}}}` —
+      `byte_count` is larger than the number of unacked bytes outstanding
+      on `target` (i.e. `receive_window_size - receive_window_remaining`).
+
+    * `{:error, conn, %Mint.HTTPError{reason: {:unknown_request_to_stream, ref}}}` —
+      `{:request, ref}` does not refer to a live stream (the stream may
+      have ended; release the leftover credit against `:connection`
+      instead).
+
+  Raises `ArgumentError` if `byte_count` is not a positive integer in
+  `1..2_147_483_647`.
+
+  This function also works when `:manual_window_management` is not set —
+  it is then equivalent to a manually emitted out-of-band `WINDOW_UPDATE`
+  on top of mint's automatic refills. In practice it is paired with the
+  manual mode.
+
+  ## Examples
+
+  Consume body data in chunks, releasing window credit as each chunk is
+  handed off downstream:
+
+      {:ok, conn} = Mint.HTTP2.connect(:https, host, 443,
+                      manual_window_management: true)
+      {:ok, conn, ref} = Mint.HTTP2.request(conn, "GET", "/huge", [], nil)
+
+      handle = fn {:data, ^ref, chunk}, conn ->
+        :ok = process(chunk)
+        {:ok, conn} = Mint.HTTP2.consume_window(conn, {:request, ref}, byte_size(chunk))
+        {:ok, conn} = Mint.HTTP2.consume_window(conn, :connection, byte_size(chunk))
+        conn
+      end
+
+  """
+  @doc since: "1.9.0"
+  @spec consume_window(t(), :connection | {:request, Types.request_ref()}, pos_integer()) ::
+          {:ok, t()} | {:error, t(), Types.error()}
+  def consume_window(conn, connection_or_request, byte_count)
+
+  def consume_window(%__MODULE__{} = _conn, _target, byte_count)
+      when not (is_integer(byte_count) and byte_count >= 1 and byte_count <= @max_window_size) do
+    raise ArgumentError,
+          "byte_count must be an integer in 1..#{@max_window_size}, got: #{inspect(byte_count)}"
+  end
+
+  def consume_window(%__MODULE__{} = conn, :connection, byte_count) do
+    unacked = conn.receive_window_size - conn.receive_window_remaining
+
+    if byte_count > unacked do
+      {:error, conn, wrap_error({:window_overflow, :connection, byte_count, unacked})}
+    else
+      frame = window_update(stream_id: 0, window_size_increment: byte_count)
+      conn = send!(conn, Frame.encode(frame))
+      conn = update_in(conn.receive_window_remaining, &(&1 + byte_count))
+      {:ok, conn}
+    end
+  catch
+    :throw, {:mint, conn, error} -> {:error, conn, error}
+  end
+
+  def consume_window(%__MODULE__{} = conn, {:request, request_ref}, byte_count) do
+    case Map.fetch(conn.ref_to_stream_id, request_ref) do
+      {:ok, stream_id} ->
+        stream = conn.streams[stream_id]
+        unacked = stream.receive_window_size - stream.receive_window_remaining
+
+        if byte_count > unacked do
+          error = wrap_error({:window_overflow, {:request, request_ref}, byte_count, unacked})
+          {:error, conn, error}
+        else
+          frame = window_update(stream_id: stream_id, window_size_increment: byte_count)
+          conn = send!(conn, Frame.encode(frame))
+          conn = update_in(conn.streams[stream_id].receive_window_remaining, &(&1 + byte_count))
+          {:ok, conn}
+        end
+
+      :error ->
+        {:error, conn, wrap_error({:unknown_request_to_stream, request_ref})}
+    end
+  catch
+    :throw, {:mint, conn, error} -> {:error, conn, error}
+  end
+
+  @doc """
   See `Mint.HTTP.stream/2`.
   """
   @impl true
@@ -1137,6 +1254,10 @@ defmodule Mint.HTTP2 do
       )
 
     validate_receive_window_update_threshold!(receive_window_update_threshold)
+
+    manual_window_management? = Keyword.get(opts, :manual_window_management, false)
+    validate_manual_window_management!(manual_window_management?)
+
     client_settings_params = Keyword.get(opts, :client_settings, [])
 
     client_settings_params =
@@ -1173,7 +1294,8 @@ defmodule Mint.HTTP2 do
       log: log?,
       receive_window_size: connection_window_size,
       receive_window_remaining: connection_window_size,
-      receive_window_update_threshold: receive_window_update_threshold
+      receive_window_update_threshold: receive_window_update_threshold,
+      manual_window_management?: manual_window_management?
     }
 
     # Mirror the advertised client settings into `conn.client_settings` up
@@ -1227,6 +1349,13 @@ defmodule Mint.HTTP2 do
       raise ArgumentError,
             "the :receive_window_update_threshold option must be a positive integer no larger than " <>
               "#{@max_window_size}, got: #{inspect(value)}"
+    end
+  end
+
+  defp validate_manual_window_management!(value) do
+    unless is_boolean(value) do
+      raise ArgumentError,
+            "the :manual_window_management option must be a boolean, got: #{inspect(value)}"
     end
   end
 
@@ -1837,16 +1966,22 @@ defmodule Mint.HTTP2 do
           conn
       end
 
-    frames =
-      []
-      |> maybe_refill_stream(conn, stream_id)
-      |> maybe_refill_conn(conn)
-
-    if frames != [] and open?(conn) do
-      conn = send!(conn, Enum.map(frames, &Frame.encode/1))
-      apply_refills(conn, frames)
-    else
+    # In manual mode the caller releases credit explicitly via
+    # `consume_window/3`, so we track the decrements but never auto-emit.
+    if conn.manual_window_management? do
       conn
+    else
+      frames =
+        []
+        |> maybe_refill_stream(conn, stream_id)
+        |> maybe_refill_conn(conn)
+
+      if frames != [] and open?(conn) do
+        conn = send!(conn, Enum.map(frames, &Frame.encode/1))
+        apply_refills(conn, frames)
+      else
+        conn
+      end
     end
   end
 
@@ -2555,6 +2690,11 @@ defmodule Mint.HTTP2 do
   def format_error({:window_size_too_small, current, new_size}) do
     "set_window_size/3 can only grow a window; new size #{new_size} is " <>
       "smaller than the current size #{current}"
+  end
+
+  def format_error({:window_overflow, target, requested, unacked}) do
+    "consume_window/3 was called with #{requested} bytes on " <>
+      "#{inspect(target)} but only #{unacked} bytes are unacked"
   end
 
   def format_error(:request_is_not_streaming) do

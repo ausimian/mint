@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New features
+
+  * Add `Mint.HTTP2.consume_window/3` and the `:manual_window_management` option to `Mint.HTTP.connect/4`. Together they let callers apply consumption-coupled backpressure on HTTP/2 streams: in manual mode, `WINDOW_UPDATE` frames are not auto-emitted when DATA frames arrive — the caller releases receive-window credit explicitly. This is the only way to apply per-stream backpressure when one of multiple multiplexed streams is consumed faster than another.
+
 ## v1.8.0
 
 ### New features
