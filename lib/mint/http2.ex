@@ -1919,7 +1919,21 @@ defmodule Mint.HTTP2 do
 
     # Regardless of whether we have the stream or not, we need to abide by flow
     # control rules so we still refill the client window for the stream_id we got.
-    window_size_increment = byte_size(data) + byte_size(padding || "")
+    #
+    # Per RFC 9113 §6.9.1: "The entire DATA frame payload is included in
+    # flow control, including the Pad Length and Padding fields if
+    # present." The padding bytes — and the 1-byte Pad Length field that
+    # precedes them — are stripped by the frame parser and never surfaced
+    # to the caller, but the server still spent flow-control credit on
+    # them, so we must refund credit for the full on-wire payload.
+    # Otherwise our view of the remaining window drifts above the
+    # server's and the stream eventually stalls.
+    window_size_increment =
+      if padding do
+        byte_size(data) + byte_size(padding) + 1
+      else
+        byte_size(data)
+      end
 
     conn =
       if window_size_increment > 0 do

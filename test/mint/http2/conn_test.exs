@@ -2122,6 +2122,31 @@ defmodule Mint.HTTP2Test do
         window_update(stream_id: ^stream_id, window_size_increment: 460_000)
       ]
     end
+
+    test "padded DATA accounts data, padding, and the 1-byte Pad Length toward flow control",
+         %{conn: conn} do
+      {conn, _ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      data_bytes = String.duplicate("a", 100)
+      padding_bytes = :binary.copy(<<0>>, 50)
+      # RFC 9113 §6.9.1: the entire DATA frame payload — Pad Length (1
+      # byte) + data + padding — counts against flow control.
+      expected_consumed = 1 + byte_size(data_bytes) + byte_size(padding_bytes)
+
+      assert {:ok, %HTTP2{} = conn, _responses} =
+               stream_frames(conn, [
+                 data(stream_id: stream_id, data: data_bytes, padding: padding_bytes)
+               ])
+
+      assert conn.receive_window_remaining == 100_000 - expected_consumed
+      assert conn.streams[stream_id].receive_window_remaining == 100_000 - expected_consumed
+
+      # The 151-byte consumption is well above the 40_000-byte threshold,
+      # so no auto-refill is expected here — the test isolates the
+      # accounting from the refill machinery.
+      assert_recv_frames []
+    end
   end
 
   describe "manual window management" do
