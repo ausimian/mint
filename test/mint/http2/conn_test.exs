@@ -2413,6 +2413,53 @@ defmodule Mint.HTTP2Test do
       assert_recv_frames [window_update(stream_id: ^stream_id, window_size_increment: 200_000)]
     end
 
+    test "set_window_size/3 preserves outstanding unacked bytes",
+         %{conn: conn} do
+      {conn, ref} = open_request(conn)
+      assert_recv_frames [headers(stream_id: stream_id)]
+
+      # Receive 30 000 bytes in three 10 KB frames (one frame would
+      # exceed the 16 384-byte default max_frame_size). With manual mode
+      # on no WINDOW_UPDATE goes out, so 30 000 bytes are unacked on
+      # both the connection and the stream — the server's send credit
+      # on each is now 70 000.
+      chunk = String.duplicate("a", 10_000)
+      frames = for _ <- 1..3, do: data(stream_id: stream_id, data: chunk)
+      assert {:ok, conn, _} = stream_frames(conn, frames)
+
+      assert conn.receive_window_size - conn.receive_window_remaining == 30_000
+
+      assert conn.streams[stream_id].receive_window_size -
+               conn.streams[stream_id].receive_window_remaining == 30_000
+
+      # Grow the connection window. set_window_size/3 sends a
+      # WINDOW_UPDATE for the increment only (100 000 bytes here);
+      # outstanding bytes must survive — historically the local tracker
+      # was reset to the new peak, silently discarding them.
+      assert {:ok, conn} = HTTP2.set_window_size(conn, :connection, 200_000)
+      assert_recv_frames [window_update(stream_id: 0, window_size_increment: 100_000)]
+      assert conn.receive_window_size == 200_000
+      assert conn.receive_window_size - conn.receive_window_remaining == 30_000
+
+      # Same for the stream.
+      assert {:ok, conn} = HTTP2.set_window_size(conn, {:request, ref}, 200_000)
+      assert_recv_frames [window_update(stream_id: ^stream_id, window_size_increment: 100_000)]
+      assert conn.streams[stream_id].receive_window_size == 200_000
+
+      assert conn.streams[stream_id].receive_window_size -
+               conn.streams[stream_id].receive_window_remaining == 30_000
+
+      # The original 30 000 outstanding bytes are still releasable on
+      # both axes — the bookkeeping was preserved across the grow.
+      assert {:ok, conn} = HTTP2.consume_window(conn, :connection, 30_000)
+      assert_recv_frames [window_update(stream_id: 0, window_size_increment: 30_000)]
+      assert conn.receive_window_remaining == 200_000
+
+      assert {:ok, conn} = HTTP2.consume_window(conn, {:request, ref}, 30_000)
+      assert_recv_frames [window_update(stream_id: ^stream_id, window_size_increment: 30_000)]
+      assert conn.streams[stream_id].receive_window_remaining == 200_000
+    end
+
     test "cancel_request/2 deletes the stream; connection credit can still be released",
          %{conn: conn} do
       {conn, ref} = open_request(conn)

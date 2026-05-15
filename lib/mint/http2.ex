@@ -922,9 +922,9 @@ defmodule Mint.HTTP2 do
   end
 
   def set_window_size(%__MODULE__{} = conn, :connection, new_size) do
-    do_set_window_size(conn, 0, conn.receive_window_size, new_size, fn conn, size ->
+    do_set_window_size(conn, 0, conn.receive_window_size, new_size, fn conn, size, increment ->
       conn = put_in(conn.receive_window_size, size)
-      put_in(conn.receive_window_remaining, size)
+      update_in(conn.receive_window_remaining, &(&1 + increment))
     end)
   catch
     :throw, {:mint, conn, error} -> {:error, conn, error}
@@ -935,9 +935,9 @@ defmodule Mint.HTTP2 do
       {:ok, stream_id} ->
         current = conn.streams[stream_id].receive_window_size
 
-        do_set_window_size(conn, stream_id, current, new_size, fn conn, size ->
+        do_set_window_size(conn, stream_id, current, new_size, fn conn, size, increment ->
           conn = put_in(conn.streams[stream_id].receive_window_size, size)
-          put_in(conn.streams[stream_id].receive_window_remaining, size)
+          update_in(conn.streams[stream_id].receive_window_remaining, &(&1 + increment))
         end)
 
       :error ->
@@ -957,10 +957,18 @@ defmodule Mint.HTTP2 do
   end
 
   defp do_set_window_size(conn, stream_id, current, new_size, update) do
+    # Bump `receive_window_remaining` by the same increment we just sent
+    # as a WINDOW_UPDATE — *not* by setting it to the new peak. The
+    # difference matters when there are outstanding unacked bytes (i.e.
+    # `remaining < receive_window_size`): the wire-level effect of this
+    # call is to add `increment` to the server's send credit, so the
+    # local tracker must shift by exactly the same amount. Setting
+    # `remaining = new_size` would silently discard those outstanding
+    # bytes, breaking `consume_window/3`'s ability to release them.
     increment = new_size - current
     frame = window_update(stream_id: stream_id, window_size_increment: increment)
     conn = send!(conn, Frame.encode(frame))
-    {:ok, update.(conn, new_size)}
+    {:ok, update.(conn, new_size, increment)}
   end
 
   @doc """
